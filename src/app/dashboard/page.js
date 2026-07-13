@@ -77,6 +77,10 @@ export default function DashboardPage() {
     }
   }
 
+  function connectGmail() {
+    window.location.assign("/api/auth/google");
+  }
+
   return (
     <AppShell>
       <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
@@ -87,13 +91,13 @@ export default function DashboardPage() {
           </p>
         </div>
         {!connected && (
-          <Link
-            href="/api/auth/google"
-            prefetch={false}
+          <button
+            type="button"
+            onClick={connectGmail}
             className="w-fit rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700"
           >
             Connect Gmail
-          </Link>
+          </button>
         )}
       </div>
 
@@ -103,13 +107,13 @@ export default function DashboardPage() {
           {!connected && (
             <>
               {" "}
-              <Link
+              <button
+                type="button"
+                onClick={connectGmail}
                 className="font-medium underline"
-                href="/api/auth/google"
-                prefetch={false}
               >
                 Connect Gmail
-              </Link>
+              </button>
             </>
           )}
         </div>

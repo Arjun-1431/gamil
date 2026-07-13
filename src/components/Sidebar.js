@@ -52,6 +52,10 @@ export default function Sidebar() {
     }
   }
 
+  function connectGmail() {
+    window.location.assign("/api/auth/google");
+  }
+
   return (
     <aside className="w-full border-b border-zinc-200 bg-white md:min-h-screen md:w-64 md:border-b-0 md:border-r">
       <div className="flex items-center justify-between gap-3 px-5 py-4 md:block">
@@ -74,13 +78,13 @@ export default function Sidebar() {
             </button>
           </>
         ) : (
-          <Link
-            href="/api/auth/google"
-            prefetch={false}
+          <button
+            type="button"
+            onClick={connectGmail}
             className="rounded-md bg-zinc-950 px-3 py-2 text-sm font-medium text-white hover:bg-zinc-800 md:mt-4 md:block md:text-center"
           >
             {authStatus.loading ? "Checking..." : "Connect"}
-          </Link>
+          </button>
         )}
       </div>
       <nav className="flex gap-1 overflow-x-auto px-3 pb-3 md:block md:space-y-1 md:overflow-visible">

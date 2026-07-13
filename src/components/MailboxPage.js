@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import AppShell from "./AppShell";
 import EmailTable from "./EmailTable";
@@ -106,6 +105,10 @@ export default function MailboxPage({ title, endpoint }) {
     setPageIndex((current) => current + 1);
   }
 
+  function connectGmail() {
+    window.location.assign("/api/auth/google");
+  }
+
   return (
     <AppShell>
       <div className="mb-5 flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
@@ -169,13 +172,13 @@ export default function MailboxPage({ title, endpoint }) {
       {error && (
         <div className="mb-4 rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">
           {error}{" "}
-          <Link
+          <button
+            type="button"
+            onClick={connectGmail}
             className="font-medium underline"
-            href="/api/auth/google"
-            prefetch={false}
           >
             Connect Gmail
-          </Link>
+          </button>
         </div>
       )}
 
