@@ -127,7 +127,7 @@ export default function FollowUpsPage() {
           <p className="mt-2 text-2xl font-semibold">{due.length}</p>
         </div>
         <div className="rounded-md border border-zinc-200 bg-white p-4">
-          <p className="text-sm text-zinc-500">15-hour Scheduler</p>
+          <p className="text-sm text-zinc-500">Daily Scheduler</p>
           <p className="mt-2 text-2xl font-semibold">
             {automationEnabled ? "Active" : "Paused"}
           </p>
