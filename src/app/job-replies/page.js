@@ -44,7 +44,7 @@ export default function JobRepliesPage() {
     setError("");
     try {
       const response = await api.post(
-        "/api/jobs/replies/analyze?limit=50&autoReply=true"
+        "/api/jobs/replies/analyze?limit=10&autoReply=true&q=newer_than:10m"
       );
       setReplies(response.data.replies || []);
       setDiagnostics(response.data.diagnostics || []);

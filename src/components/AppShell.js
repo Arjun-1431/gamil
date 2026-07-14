@@ -12,7 +12,7 @@ export default function AppShell({ children }) {
       if (stopped) return;
       try {
         await api.post(
-          "/api/jobs/replies/analyze?limit=50&autoReply=true&q=newer_than:30d"
+          "/api/jobs/replies/analyze?limit=10&autoReply=true&q=newer_than:10m"
         );
       } catch (error) {
         console.warn("[IncomingMail] background poll failed", {
@@ -24,7 +24,7 @@ export default function AppShell({ children }) {
     }
 
     pollIncomingMail();
-    const intervalId = window.setInterval(pollIncomingMail, 30000);
+    const intervalId = window.setInterval(pollIncomingMail, 10000);
 
     return () => {
       stopped = true;

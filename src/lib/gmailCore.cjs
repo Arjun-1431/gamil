@@ -459,12 +459,50 @@ function shouldSkipInboxAutoReply(email, accountEmail) {
 }
 
 function buildInboxAutoReply(email) {
+  const subject = email.subject || "Your email";
+  const text = stripHtml(`${email.subject || ""}\n${email.snippet || ""}\n${email.body || ""}`);
+  const lowerText = text.toLowerCase();
+  const isInterview =
+    /interview|scheduled|schedule|meeting|call|round|venue/.test(lowerText);
+  const isShortlisted =
+    /shortlisted|selected|pleased to inform|congratulations/.test(lowerText);
+  const isOffer = /offer letter|job offer|offer of employment/.test(lowerText);
+  const timeMatch = text.match(/\b(?:[01]?\d|2[0-3])(?::[0-5]\d)?\s*(?:AM|PM|am|pm)\b/);
+  const mentionedTime = timeMatch?.[0];
+
+  let bodyHtml =
+    "<p>Hello,</p><p>Thank you for your email. I have received your message and will get back to you soon.</p><p>Best regards,<br/>Arjun Singh</p>";
+
+  if (isInterview) {
+    bodyHtml = [
+      "<p>Hello,</p>",
+      `<p>Thank you for the update. I am glad to hear that I have been ${
+        isShortlisted ? "shortlisted" : "considered"
+      } for the interview.</p>`,
+      `<p>I confirm my availability for the interview${
+        mentionedTime ? ` at ${mentionedTime}` : ""
+      }. Please share any further details or instructions if required.</p>`,
+      "<p>Best regards,<br/>Arjun Singh</p>",
+    ].join("");
+  } else if (isOffer) {
+    bodyHtml = [
+      "<p>Hello,</p>",
+      "<p>Thank you for sharing the offer details. I appreciate the opportunity and will review the information carefully.</p>",
+      "<p>I will get back to you soon if any clarification is needed.</p>",
+      "<p>Best regards,<br/>Arjun Singh</p>",
+    ].join("");
+  } else if (isShortlisted) {
+    bodyHtml = [
+      "<p>Hello,</p>",
+      "<p>Thank you for the update. I am pleased to hear that I have been shortlisted.</p>",
+      "<p>Please let me know the next steps and any details I should prepare.</p>",
+      "<p>Best regards,<br/>Arjun Singh</p>",
+    ].join("");
+  }
+
   return {
-    subject: email.subject?.toLowerCase().startsWith("re:")
-      ? email.subject
-      : `Re: ${email.subject || "Your email"}`,
-    bodyHtml:
-      "<p>Hello,</p><p>Thank you for your email. I have received your message and will get back to you soon.</p><p>Best regards,<br/>Arjun Singh</p>",
+    subject: subject.toLowerCase().startsWith("re:") ? subject : `Re: ${subject}`,
+    bodyHtml,
   };
 }
 
@@ -476,7 +514,7 @@ async function generateInboxAutoReplyEmail(email) {
       {
         role: "system",
         content:
-          "Return strict JSON only. Write a concise, polite email reply. Acknowledge the sender's message naturally and say you will get back soon if needed. Do not invent facts.",
+          "Return strict JSON only. Write a concise, polite email reply according to the received email. If it mentions interview, shortlist, selection, offer, schedule, time, or venue, acknowledge those details naturally and confirm interest/availability. Do not write a generic received-message reply unless the email has no actionable context. Do not invent facts.",
       },
       {
         role: "user",
@@ -516,7 +554,11 @@ async function callNvidiaJson(messages, fallback) {
   }
 
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+  const nvidiaTimeoutMs = Math.max(
+    5000,
+    Math.min(Number(process.env.NVIDIA_TIMEOUT_MS || 25000), 60000)
+  );
+  const timeoutId = setTimeout(() => controller.abort(), nvidiaTimeoutMs);
 
   try {
     const response = await fetch("https://integrate.api.nvidia.com/v1/chat/completions", {
@@ -528,7 +570,7 @@ async function callNvidiaJson(messages, fallback) {
       body: JSON.stringify({
         model: process.env.NVIDIA_MODEL || "meta/llama-3.1-70b-instruct",
         temperature: 0.1,
-        max_tokens: 900,
+        max_tokens: 350,
         messages,
       }),
       signal: controller.signal,
@@ -551,7 +593,9 @@ async function callNvidiaJson(messages, fallback) {
     }
   } catch (error) {
     if (error.name === "AbortError") {
-      console.warn("NVIDIA API request timed out, using fallback");
+      console.warn(
+        `NVIDIA API request timed out after ${nvidiaTimeoutMs}ms, using fallback`
+      );
       return fallback;
     }
     console.warn(`NVIDIA API request failed, using fallback: ${error.message}`);
