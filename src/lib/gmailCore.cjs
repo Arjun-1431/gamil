@@ -28,6 +28,9 @@ const INBOX_CATEGORY_LABELS = {
 };
 
 const READ_ONLY_FS_ERROR_CODES = new Set(["EROFS", "EACCES", "EPERM"]);
+const RECENT_INCOMING_MAIL_GRACE_MS = 5 * 60 * 1000;
+const INCOMING_MAIL_WATCH_STARTED_AT_MS = Date.now();
+const seenIncomingMailByScope = new Map();
 
 function getOAuthClient() {
   const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI } =
@@ -147,6 +150,73 @@ function normalizeFullMessage(message) {
   };
 }
 
+function getIncomingMailTime(email) {
+  const internalDate = Number(email?.internalDate || 0);
+  if (Number.isFinite(internalDate) && internalDate > 0) return internalDate;
+
+  const parsedDate = Date.parse(email?.date || "");
+  return Number.isFinite(parsedDate) ? parsedDate : 0;
+}
+
+function getSeenIncomingMailScope(scope) {
+  const seen = seenIncomingMailByScope.get(scope);
+  if (seen) return seen;
+
+  const nextSeen = new Set();
+  seenIncomingMailByScope.set(scope, nextSeen);
+  return nextSeen;
+}
+
+function trackIncomingMail(email, source = "unknown", scope = source) {
+  if (!email?.id) return false;
+
+  const seen = getSeenIncomingMailScope(scope);
+  if (seen.has(email.id)) return false;
+
+  seen.add(email.id);
+  console.log("[IncomingMail] NEW", {
+    source,
+    scope,
+    id: email.id,
+    threadId: email.threadId,
+    from: email.from,
+    to: email.to,
+    subject: email.subject,
+    date: email.date,
+    internalDate: email.internalDate,
+    unread: email.unread,
+    labels: email.labels,
+    snippet: email.snippet,
+  });
+  return true;
+}
+
+function trackIncomingMailBatch(emails, source = "unknown", scope = source) {
+  const seen = getSeenIncomingMailScope(scope);
+  const newEmails = [];
+
+  for (const email of emails) {
+    if (!email?.id) continue;
+
+    const mailTime = getIncomingMailTime(email);
+    const recentlyArrived =
+      mailTime >= Date.now() - RECENT_INCOMING_MAIL_GRACE_MS;
+    const arrivedAfterWatchStarted =
+      mailTime > INCOMING_MAIL_WATCH_STARTED_AT_MS;
+
+    if (!arrivedAfterWatchStarted && !recentlyArrived) {
+      seen.add(email.id);
+      continue;
+    }
+
+    if (trackIncomingMail(email, source, scope)) {
+      newEmails.push(email);
+    }
+  }
+
+  return newEmails;
+}
+
 function stripHtml(value = "") {
   return value
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -173,6 +243,8 @@ function buildSearchQuery(query = {}) {
 async function listMessages(req, labelIds) {
   const gmail = getAuthedGmail(req);
   const maxResults = Math.min(Number(req.query.limit || 20), 50);
+  const isInboxRequest = labelIds.includes("INBOX");
+
   const listResponse = await gmail.users.messages.list({
     userId: "me",
     labelIds,
@@ -196,6 +268,14 @@ async function listMessages(req, labelIds) {
 
   const sorted = hydrated.sort((a, b) => (b.sortTime || 0) - (a.sortTime || 0));
 
+  if (isInboxRequest) {
+    trackIncomingMailBatch(
+      sorted,
+      "gmail/inbox",
+      `incoming:${req.session?.gmailEmail || "connected"}`
+    );
+  }
+
   return {
     emails: sorted,
     nextPageToken: listResponse.data.nextPageToken || null,
@@ -203,18 +283,29 @@ async function listMessages(req, labelIds) {
   };
 }
 
+function cleanEmailHeader(value = "") {
+  return String(value).replace(/[\r\n]+/g, " ").trim();
+}
+
 function createRawEmail({ to, subject, body, cc, bcc, inReplyTo, references }) {
+  const safeBody =
+    body && String(body).trim()
+      ? String(body)
+      : "<p>Hello,</p><p>Thank you for your email. I have received your message and will get back to you soon.</p><p>Best regards,<br/>Arjun Singh</p>";
+
   const lines = [
-    `To: ${to}`,
-    cc ? `Cc: ${cc}` : null,
-    bcc ? `Bcc: ${bcc}` : null,
-    `Subject: ${subject || ""}`,
-    inReplyTo ? `In-Reply-To: ${inReplyTo}` : null,
-    references ? `References: ${references}` : null,
-    "Content-Type: text/html; charset=utf-8",
+    `To: ${cleanEmailHeader(to)}`,
+    cc ? `Cc: ${cleanEmailHeader(cc)}` : null,
+    bcc ? `Bcc: ${cleanEmailHeader(bcc)}` : null,
+    `Subject: ${cleanEmailHeader(subject || "")}`,
+    inReplyTo ? `In-Reply-To: ${cleanEmailHeader(inReplyTo)}` : null,
+    references ? `References: ${cleanEmailHeader(references)}` : null,
+    "MIME-Version: 1.0",
+    "Content-Type: text/html; charset=UTF-8",
+    "Content-Transfer-Encoding: 8bit",
     "",
-    body || "",
-  ].filter(Boolean);
+    safeBody,
+  ].filter((line) => line !== null);
 
   return Buffer.from(lines.join("\r\n"))
     .toString("base64")
@@ -267,6 +358,7 @@ function getAccount(store, emailAddress) {
       applications: {},
       importantInbox: {},
       jobReplies: {},
+      inboxAutoReplies: {},
     };
   }
   if (!store.accounts[emailAddress].importantInbox) {
@@ -274,6 +366,9 @@ function getAccount(store, emailAddress) {
   }
   if (!store.accounts[emailAddress].jobReplies) {
     store.accounts[emailAddress].jobReplies = {};
+  }
+  if (!store.accounts[emailAddress].inboxAutoReplies) {
+    store.accounts[emailAddress].inboxAutoReplies = {};
   }
   return store.accounts[emailAddress];
 }
@@ -354,11 +449,70 @@ function inferJobReplyStatus(email) {
   return { status: "other", reason: "" };
 }
 
+function shouldSkipInboxAutoReply(email, accountEmail) {
+  const senderEmail = extractEmailAddress(email.from);
+  if (!senderEmail || senderEmail === accountEmail.toLowerCase()) return true;
+  if (/no-?reply|do-?not-?reply|mailer-daemon|postmaster/.test(senderEmail)) {
+    return true;
+  }
+  return false;
+}
+
+function buildInboxAutoReply(email) {
+  return {
+    subject: email.subject?.toLowerCase().startsWith("re:")
+      ? email.subject
+      : `Re: ${email.subject || "Your email"}`,
+    bodyHtml:
+      "<p>Hello,</p><p>Thank you for your email. I have received your message and will get back to you soon.</p><p>Best regards,<br/>Arjun Singh</p>",
+  };
+}
+
+async function generateInboxAutoReplyEmail(email) {
+  const fallback = buildInboxAutoReply(email);
+
+  const result = await callNvidiaJson(
+    [
+      {
+        role: "system",
+        content:
+          "Return strict JSON only. Write a concise, polite email reply. Acknowledge the sender's message naturally and say you will get back soon if needed. Do not invent facts.",
+      },
+      {
+        role: "user",
+        content: JSON.stringify({
+          expectedSchema: { subject: "string", bodyHtml: "string" },
+          originalSubject: email.subject,
+          from: email.from,
+          to: email.to,
+          snippet: email.snippet,
+          body: stripHtml(email.body || "").slice(0, 2200),
+        }),
+      },
+    ],
+    fallback
+  );
+
+  return {
+    subject: result.subject || fallback.subject,
+    bodyHtml: result.bodyHtml || fallback.bodyHtml,
+  };
+}
+
+function logInboxAutoReply(message, details, diagnostics) {
+  if (diagnostics) {
+    diagnostics.push({
+      at: new Date().toISOString(),
+      message,
+      details: details === undefined ? null : details,
+    });
+  }
+}
+
 async function callNvidiaJson(messages, fallback) {
   if (!process.env.NVIDIA_API_KEY) {
-    const error = new Error("NVIDIA_API_KEY is not configured.");
-    error.statusCode = 400;
-    throw error;
+    console.warn("NVIDIA_API_KEY is not configured, using fallback");
+    return fallback;
   }
 
   const controller = new AbortController();
@@ -381,9 +535,8 @@ async function callNvidiaJson(messages, fallback) {
     });
 
     if (!response.ok) {
-      const error = new Error(`NVIDIA API failed with status ${response.status}.`);
-      error.statusCode = 502;
-      throw error;
+      console.warn(`NVIDIA API failed with status ${response.status}, using fallback`);
+      return fallback;
     }
 
     const data = await response.json();
@@ -401,7 +554,8 @@ async function callNvidiaJson(messages, fallback) {
       console.warn("NVIDIA API request timed out, using fallback");
       return fallback;
     }
-    throw error;
+    console.warn(`NVIDIA API request failed, using fallback: ${error.message}`);
+    return fallback;
   } finally {
     clearTimeout(timeoutId);
   }
@@ -595,7 +749,12 @@ async function classifyJobReplyEmail(email) {
 }
 
 async function generateJobReplyEmail(jobReply) {
-  const fallbackBody = `<p>Hello,</p><p>Thank you for your email. I appreciate the update and I am interested in moving forward. Please let me know the next steps and a suitable time for the interview or discussion.</p><p>Best regards,<br/>Arjun Singh</p>`;
+  const fallback = {
+    subject: jobReply.subject?.toLowerCase().startsWith("re:")
+      ? jobReply.subject
+      : `Re: ${jobReply.subject}`,
+    bodyHtml: `<p>Hello,</p><p>Thank you for your email. I appreciate the update and I am interested in moving forward. Please let me know the next steps and a suitable time for the interview or discussion.</p><p>Best regards,<br/>Arjun Singh</p>`,
+  };
 
   const result = await callNvidiaJson(
     [
@@ -618,21 +777,12 @@ async function generateJobReplyEmail(jobReply) {
         }),
       },
     ],
-    {
-      subject: jobReply.subject?.toLowerCase().startsWith("re:")
-        ? jobReply.subject
-        : `Re: ${jobReply.subject}`,
-      bodyHtml: fallbackBody,
-    }
+    fallback
   );
 
   return {
-    subject:
-      result.subject ||
-      (jobReply.subject?.toLowerCase().startsWith("re:")
-        ? jobReply.subject
-        : `Re: ${jobReply.subject}`),
-    bodyHtml: result.bodyHtml || fallbackBody,
+    subject: result.subject || fallback.subject,
+    bodyHtml: result.bodyHtml || fallback.bodyHtml,
   };
 }
 
@@ -801,7 +951,7 @@ async function analyzeJobReplies(req) {
         if (
           autoReply &&
           !existing.replySentAt &&
-          ["selected", "interview_requested", "shortlisted"].includes(existing.status)
+          ["selected", "interview_requested", "shortlisted", "replied"].includes(existing.status)
         ) {
           jobRepliesToGenerate.push({ jobReply: existing, isExisting: true });
         }
@@ -871,7 +1021,7 @@ async function analyzeJobReplies(req) {
     if (
       autoReply &&
       !jobReply.replySentAt &&
-      ["selected", "interview_requested", "shortlisted"].includes(jobReply.status)
+      ["selected", "interview_requested", "shortlisted", "replied"].includes(jobReply.status)
     ) {
       jobRepliesToGenerate.push({ jobReply, isExisting: false });
     }
@@ -933,6 +1083,209 @@ async function analyzeJobReplies(req) {
 
   writeJobStore(store);
   return account;
+}
+
+async function sendInboxAutoReplies(gmail, account, accountEmail, options = {}) {
+  const diagnostics = [];
+  const query = options.q || "newer_than:30d";
+  const limit = Math.min(Number(options.limit || 50), 75);
+
+  logInboxAutoReply("starting scan", {
+    accountEmail,
+    query,
+    limit,
+    alreadyTracked: Object.keys(account.inboxAutoReplies || {}).length,
+  }, diagnostics);
+
+  const listResponse = await gmail.users.messages.list({
+    userId: "me",
+    labelIds: ["INBOX"],
+    maxResults: limit,
+    q: query,
+  });
+
+  const listedMessages = listResponse.data.messages || [];
+  logInboxAutoReply("gmail list result", {
+    accountEmail,
+    resultSizeEstimate: listResponse.data.resultSizeEstimate || 0,
+    listedCount: listedMessages.length,
+    messageIds: listedMessages.map((item) => item.id),
+  }, diagnostics);
+
+  const messages = await Promise.all(
+    listedMessages.map(async (item) => {
+      try {
+        const email = await getFullMessage(gmail, item.id);
+        logInboxAutoReply("fetched message", {
+          id: email.id,
+          threadId: email.threadId,
+          from: email.from,
+          to: email.to,
+          subject: email.subject,
+          labels: email.labels,
+          unread: email.unread,
+          date: email.date,
+        }, diagnostics);
+        return email;
+      } catch (error) {
+        const details = { id: item.id, error: error.message };
+        diagnostics.push({
+          at: new Date().toISOString(),
+          message: "failed to fetch email",
+          details,
+        });
+        console.warn("[InboxAutoReply] failed to fetch email", details);
+        return null;
+      }
+    })
+  );
+
+  const newMessages = trackIncomingMailBatch(
+    messages.filter(Boolean),
+    "auto-reply-scan",
+    `incoming:${accountEmail}`
+  );
+
+  for (const email of newMessages) {
+    if (!email) {
+      logInboxAutoReply("skip null email after fetch failure", undefined, diagnostics);
+      continue;
+    }
+
+    if (account.inboxAutoReplies[email.id]?.replySentAt) {
+      logInboxAutoReply("skip already replied", {
+        id: email.id,
+        replySentAt: account.inboxAutoReplies[email.id].replySentAt,
+      }, diagnostics);
+      continue;
+    }
+
+    const senderEmail = extractEmailAddress(email.from);
+    if (shouldSkipInboxAutoReply(email, accountEmail)) {
+      logInboxAutoReply("skip sender", {
+        id: email.id,
+        from: email.from,
+        senderEmail,
+        accountEmail,
+        reason:
+          senderEmail === accountEmail.toLowerCase()
+            ? "sender is the connected account"
+            : "sender is empty or no-reply/system address",
+      }, diagnostics);
+      continue;
+    }
+
+    logInboxAutoReply("generating nvidia reply for new mail only", {
+      id: email.id,
+      from: email.from,
+      subject: email.subject,
+    }, diagnostics);
+    const generated = await generateInboxAutoReplyEmail(email);
+    logInboxAutoReply("sending reply", {
+      id: email.id,
+      threadId: email.threadId,
+      to: email.replyTo || email.from,
+      subject: generated.subject,
+      bodyLength: String(generated.bodyHtml || "").length,
+      bodyPreview: stripHtml(generated.bodyHtml || "").slice(0, 160),
+      generatedBy: "nvidia",
+      inReplyTo: email.messageId,
+      references: [email.references, email.messageId].filter(Boolean).join(" "),
+    }, diagnostics);
+
+    const replyRecord = {
+      id: email.id,
+      threadId: email.threadId,
+      subject: email.subject,
+      from: email.from,
+      replyTo: email.replyTo,
+      messageId: email.messageId,
+      references: email.references,
+      date: email.date,
+      sortTime: email.sortTime,
+      snippet: email.snippet,
+      status: "replied",
+      reason: "Auto reply sent.",
+      confidence: 1,
+      analyzedAt: new Date().toISOString(),
+      autoReplied: true,
+      replySentAt: null,
+    };
+
+    try {
+      await gmail.users.messages.send({
+        userId: "me",
+        requestBody: {
+          threadId: email.threadId,
+          raw: createRawEmail({
+            to: email.replyTo || email.from,
+            subject: generated.subject,
+            body: generated.bodyHtml,
+            inReplyTo: email.messageId,
+            references: [email.references, email.messageId].filter(Boolean).join(" "),
+          }),
+        },
+      });
+      replyRecord.replySentAt = new Date().toISOString();
+      account.inboxAutoReplies[email.id] = replyRecord;
+      account.jobReplies[email.id] = replyRecord;
+      logInboxAutoReply("reply sent", {
+        id: email.id,
+        to: email.replyTo || email.from,
+        replySentAt: replyRecord.replySentAt,
+      }, diagnostics);
+    } catch (error) {
+      const details = {
+        id: email.id,
+        to: email.replyTo || email.from,
+        message: error.message,
+        code: error.code,
+        status: error.status,
+        response: error.response?.data,
+      };
+      diagnostics.push({
+        at: new Date().toISOString(),
+        message: "auto reply failed",
+        details,
+      });
+      console.warn("[InboxAutoReply] auto reply failed", details);
+      replyRecord.reason = `Auto reply failed: ${error.message}`;
+      account.inboxAutoReplies[email.id] = replyRecord;
+      account.jobReplies[email.id] = replyRecord;
+    }
+  }
+
+  logInboxAutoReply("scan complete", {
+    accountEmail,
+    tracked: Object.keys(account.inboxAutoReplies || {}).length,
+    sent: Object.values(account.inboxAutoReplies || {}).filter(
+      (reply) => reply.replySentAt
+    ).length,
+  }, diagnostics);
+
+  return { account, diagnostics };
+}
+
+async function autoReplyInboxEmails(req) {
+  const gmail = getAuthedGmail(req);
+  const profile = await gmail.users.getProfile({ userId: "me" });
+  const accountEmail = profile.data.emailAddress;
+  logInboxAutoReply("manual route connected gmail profile", {
+    accountEmail,
+    query: req.query.q || "newer_than:30d",
+    limit: req.query.limit || 50,
+  });
+  const store = readJobStore();
+  const account = getAccount(store, accountEmail);
+  account.encryptedTokens = encryptTokens(req.session.googleTokens);
+
+  const result = await sendInboxAutoReplies(gmail, account, accountEmail, {
+    limit: req.query.limit,
+    q: req.query.q,
+  });
+
+  writeJobStore(store);
+  return result;
 }
 
 function serializeJobReplies(account) {
@@ -1214,9 +1567,24 @@ async function runDueFollowUps() {
   let changed = false;
 
   for (const [emailAddress, account] of Object.entries(store.accounts)) {
-    if (!account.automationEnabled || !account.encryptedTokens) continue;
+    if (!account.encryptedTokens) continue;
     const tokens = decryptTokens(account.encryptedTokens);
     const gmail = getGmailFromTokens(tokens);
+
+    try {
+      const before = Object.values(account.inboxAutoReplies || {}).filter(
+        (reply) => reply.replySentAt
+      ).length;
+      await sendInboxAutoReplies(gmail, account, emailAddress);
+      const after = Object.values(account.inboxAutoReplies || {}).filter(
+        (reply) => reply.replySentAt
+      ).length;
+      if (after !== before) changed = true;
+    } catch (error) {
+      console.warn(`Inbox auto reply failed for ${emailAddress}: ${error.message}`);
+    }
+
+    if (!account.automationEnabled) continue;
     for (const application of getDueApplications(account)) {
       try {
         await sendFollowUp(gmail, application);
@@ -1261,6 +1629,7 @@ module.exports = {
   extractEmailAddress,
   generateJobReplyEmail,
   analyzeJobReplies,
+  autoReplyInboxEmails,
   serializeJobReplies,
   analyzeImportantInbox,
   serializeImportantInbox,

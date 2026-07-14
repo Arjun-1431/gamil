@@ -399,8 +399,16 @@ async function handleJobs(request, parts, req) {
   }
 
   if (path === "jobs/replies/analyze" && request.method === "POST") {
+    if (req.query.autoReply === "true") {
+      const { account, diagnostics } = await core.autoReplyInboxEmails(req);
+      return json(
+        { replies: core.serializeJobReplies(account), diagnostics },
+        req.session
+      );
+    }
+
     const account = await core.analyzeJobReplies(req);
-    return json({ replies: core.serializeJobReplies(account) }, req.session);
+    return json({ replies: core.serializeJobReplies(account), diagnostics: [] }, req.session);
   }
 
   if (
